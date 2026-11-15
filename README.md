@@ -69,12 +69,44 @@ bronze_ingest  →  silver_clean  →  gold_aggregates
 
 Each task depends on the previous one, so Silver only runs after a successful Bronze load and Gold only after a successful Silver load.
 
+## Incremental pipeline (v2): Auto Loader + MERGE
+
+The batch pipeline rebuilds every table on every run. Version 2 processes **only new data**, the way production pipelines do.
+
+```mermaid
+flowchart LR
+    L[Landing volume<br/>one JSON folder per day] -->|Auto Loader<br/>new files only| B[bronze_trips_incremental]
+    B -->|Delta stream<br/>new rows only| Q{Data quality<br/>rules}
+    Q -->|pass: MERGE on trip_id| S[silver_trips_incremental]
+    Q -->|fail: append| X[silver_trips_incremental_quarantine]
+```
+
+| Notebook | Purpose |
+|---|---|
+| `04_setup_landing_zone` | Creates a Unity Catalog volume and lands the first 50 days of trips as one JSON folder per day, simulating a source system |
+| `05_bronze_autoloader` | Auto Loader (`cloudFiles`, `availableNow` trigger) ingests only files it has not seen before; a checkpoint tracks processed files and `_source_file` records lineage |
+| `06_silver_merge` | Streams only new Bronze rows, applies the same quality rules, and upserts with `MERGE` on a SHA-256 `trip_id`, so re-processing never creates duplicates |
+| `07_land_next_day` | Drops the next day's file into the landing zone to test an incremental run |
+
+The two incremental notebooks run as a second Databricks Job, `nyc_taxi_incremental_pipeline`: `bronze_autoloader → silver_merge`.
+
+### Proving it only processes new data
+
+| Run | What landed | Bronze rows written |
+|---|---|---|
+| Initial load | 50 daily files | 18,063 (Silver: 17,964 valid, 99 quarantined, 0 duplicate `trip_id`s) |
+| New day arrives (2016-02-20) | 1 new file | 414 (only the new file) |
+| Re-run with no new data | nothing | 0 |
+
+Key techniques: Auto Loader with checkpoints, Structured Streaming `availableNow` triggers, `foreachBatch` with Delta `MERGE`, deterministic hash keys for idempotency, explicit schemas, and file-level lineage.
+
 ## How to run it
 
 1. Sign up for [Databricks Free Edition](https://www.databricks.com/learn/free-edition).
-2. In your workspace, go to **Workspace → Home → ⋮ → Import** and import the three `.py` notebooks from this repo.
-3. Run `01_bronze_ingest`, `02_silver_clean` and `03_gold_aggregates` in order on **Serverless** compute, or create a Job with the three notebooks as dependent tasks.
-4. Query the results, for example:
+2. In your workspace, go to **Workspace → Home → ⋮ → Import** and import the `.py` notebooks from this repo.
+3. **Batch pipeline:** run `01_bronze_ingest`, `02_silver_clean` and `03_gold_aggregates` in order on **Serverless** compute, or create a Job with the three notebooks as dependent tasks.
+4. **Incremental pipeline:** run `04_setup_landing_zone` once, then `05_bronze_autoloader` and `06_silver_merge`. Run `07_land_next_day` to simulate a new day, then run 05 and 06 again and compare the row counts.
+5. Query the results, for example:
    ```sql
    SELECT * FROM workspace.nyc_taxi_lakehouse.gold_pickup_zip_performance ORDER BY revenue_rank LIMIT 10;
    ```
@@ -83,11 +115,11 @@ The source data is `samples.nyctaxi.trips`, a sample dataset built into every Da
 
 ## Tech stack
 
-Databricks (Free Edition, serverless) · PySpark · Delta Lake · Unity Catalog · Databricks Jobs · SQL
+Databricks (Free Edition, serverless) · PySpark · Delta Lake · Auto Loader · Structured Streaming · Delta MERGE · Unity Catalog (tables and volumes) · Databricks Jobs · SQL
 
 ## What I would change for production
 
-- **Incremental loads**: replace full overwrites with Auto Loader or `MERGE INTO` so each run only processes new data.
+- **Incremental loads**: done in v2 for Bronze and Silver (see above); the next step is building Gold incrementally from Silver changes.
 - **Scalable ranking**: the ZIP revenue ranking uses an unpartitioned window, which is fine for 120 aggregated rows but would be partitioned (for example by region or month) at larger scale.
 - **Declarative quality checks**: move the rules into Lakeflow Declarative Pipelines expectations to get built-in data quality metrics.
 - **Alerting**: add job failure notifications and a threshold alert if the quarantine rate rises above an agreed level.
